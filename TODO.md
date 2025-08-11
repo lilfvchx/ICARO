@@ -1,4 +1,3 @@
-De acuerdo. He procesado el documento `AGENTS.md` y he preparado los entregables solicitados.
 
 ### A) Resumen Experto
 
@@ -10,7 +9,7 @@ El **alcance** del agente cubre un ciclo de vida completo: inicialización y eva
 1.  **Inicialización y Evasión**: Verifica el entorno y se desofusca.
 2.  **Comunicación P2P**: Gestiona la red DHT (Kademlia), el cifrado (XChaCha20) y los fallbacks (HTTP/DNS).
 3.  **Propagación**: Escanea redes (LAN/WAN), ejecuta ataques de fuerza bruta y explota CVEs.
-4.  **Persistencia**: Asegura la supervivencia mediante técnicas a nivel de sistema de archivos, procesos y firmware (bootloader).
+4.  **Persistencia**: Asegura la supervivencia mediante técnicas a nivel de sistema de archivos, procesos
 5.  **Ejecución de Payloads**: Descarga y ejecuta módulos de ataque nativos o scripts (Lua) en memoria.
 
 ---
