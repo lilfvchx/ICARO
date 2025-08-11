@@ -1,120 +1,344 @@
-# src/crypto.nim
-# Módulo que implementa funciones criptográficas para cifrado de payloads usando XChaCha20-Poly1305.
-# Incluye manejo de claves derivadas con HKDF y verificación de integridad.
+import std/[random, os, times, strutils]
+import nimcrypto/[sha2, hmac, utils]
+import sodium
+import chronicles
 
-import nimcrypto/xchachapoly
-import nimcrypto/sysrand
-import nimcrypto/hkdf
-import nimcrypto/sha2  # Para HKDF-SHA256
-import sequtils  # Para operaciones con secuencias
-
-# Excepciones definidas
 type
   CryptoError* = object of CatchableError
+  
+  KeyDerivationParams* = object
+    salt*: seq[byte]
+    info*: seq[byte]
+    iterations*: int
+  
+  CryptoContext* = ref object
+    masterKey: seq[byte]
+    sessionKeys: Table[string, SessionKey]
+    rotationInterval: Duration
+    lastRotation: DateTime
+  
+  SessionKey* = object
+    key*: seq[byte]
+    createdAt*: DateTime
+    usageCount*: int
+    maxUsage*: int
 
-# Configuraciones
 const
-  KEY_SIZE = 32  # Tamaño de clave en bytes
-  NONCE_SIZE = 24  # Tamaño de nonce en bytes para XChaCha20
-  TAG_SIZE = 16  # Tamaño del tag de autenticación
-  MAX_AAD_SIZE = 16384  # 16KB máximo para AAD
+  KeySize* = 32
+  NonceSize* = 24
+  TagSize* = 16
+  MaxAadSize* = 16384  # 16KB
+  DefaultKeyRotationInterval* = initDuration(hours = 1)
+  MaxKeyUsage* = 10000
 
-# Proc principal para cifrado
+# Inicialización del módulo
+proc initCrypto*() =
+  ## Inicializa la librería de criptografía
+  if sodium_init() < 0:
+    raise newException(CryptoError, "Failed to initialize libsodium")
+  randomize()
+
+# Generación segura de números aleatorios
+proc secureRandom*(size: int): seq[byte] =
+  ## Genera bytes aleatorios criptográficamente seguros
+  result = newSeq[byte](size)
+  randombytes_buf(addr result[0], size.csize_t)
+
+# Derivación de claves
+proc deriveKey*(masterKey: seq[byte], salt: seq[byte], info: seq[byte] = @[]): seq[byte] =
+  ## Deriva una clave usando HKDF-SHA256
+  if masterKey.len != KeySize:
+    raise newException(CryptoError, "Master key must be 32 bytes")
+  
+  if salt.len < 16:
+    raise newException(CryptoError, "Salt must be at least 16 bytes")
+  
+  result = newSeq[byte](KeySize)
+  
+  # HKDF Extract
+  var prk: array[32, byte]
+  let hmacCtx = hmac.new(sha256, salt)
+  hmacCtx.update(masterKey)
+  hmacCtx.finish(prk)
+  
+  # HKDF Expand
+  var okm = newSeq[byte](KeySize)
+  var counter: byte = 1
+  let expandCtx = hmac.new(sha256, prk)
+  
+  if info.len > 0:
+    expandCtx.update(info)
+  expandCtx.update([counter])
+  expandCtx.finish(okm)
+  
+  result = okm
+
+# Función principal de cifrado
 proc encryptPayload*(data: seq[byte], key: seq[byte], aad: seq[byte] = @[]): seq[byte] {.raises: [CryptoError].} =
-  ## Cifra un payload usando XChaCha20-Poly1305 con datos autenticados adicionales (AAD).
+  ## Cifra un payload usando XChaCha20-Poly1305 con AAD
   
-  if key.len != KEY_SIZE:
-    raise newException(CryptoError, "La clave debe tener exactamente " & $KEY_SIZE & " bytes")
+  # Validación de precondiciones
+  if key.len != KeySize:
+    raise newException(CryptoError, 
+      "Invalid key size: expected " & $KeySize & " bytes, got " & $key.len)
   
-  if aad.len > MAX_AAD_SIZE:
-    raise newException(CryptoError, "Los datos AAD exceden el límite de " & $MAX_AAD_SIZE & " bytes")
+  if aad.len > MaxAadSize:
+    raise newException(CryptoError, 
+      "AAD too large: maximum " & $MaxAadSize & " bytes, got " & $aad.len)
   
-  var nonce: array[NONCE_SIZE, byte]
-  if randomBytes(nonce) != NONCE_SIZE:
-    raise newException(CryptoError, "Fallo al generar nonce aleatorio")
+  if data.len == 0:
+    raise newException(CryptoError, "Cannot encrypt empty data")
   
-  var ctx: XChaChaPoly
-  if not ctx.init(key, nonce):
-    raise newException(CryptoError, "Fallo en la inicialización del contexto de cifrado")
+  # Generar nonce aleatorio
+  let nonce = secureRandom(NonceSize)
   
-  ctx.updateAAD(aad)
+  # Preparar buffer de salida: nonce + ciphertext + tag
+  let ciphertextLen = data.len + TagSize
+  result = newSeq[byte](NonceSize + ciphertextLen)
   
-  var ciphertext = newSeq[byte](data.len)
-  ctx.encrypt(data, ciphertext)
+  # Copiar nonce al inicio del resultado
+  copyMem(addr result[0], unsafeAddr nonce[0], NonceSize)
   
-  var tag: array[TAG_SIZE, byte]
-  ctx.getTag(tag)
+  # Cifrar datos
+  var ciphertext = addr result[NonceSize]
+  var ciphertextLenOut: culonglong
   
-  ctx.clear()
+  let ret = crypto_aead_xchacha20poly1305_ietf_encrypt(
+    ciphertext,
+    addr ciphertextLenOut,
+    unsafeAddr data[0],
+    data.len.culonglong,
+    if aad.len > 0: unsafeAddr aad[0] else: nil,
+    aad.len.culonglong,
+    nil,  # No secret nonce
+    unsafeAddr nonce[0],
+    unsafeAddr key[0]
+  )
   
-  # Resultado: nonce + ciphertext + tag
-  result = nonce.toSeq() & ciphertext & tag.toSeq()
+  if ret != 0:
+    raise newException(CryptoError, "Encryption failed")
+  
+  # Verificar postcondición
+  assert ciphertextLenOut.int == ciphertextLen
+  
+  # Limpiar datos sensibles de la memoria
+  zeroMem(unsafeAddr nonce[0], NonceSize)
+  
+  debug "Payload encrypted", 
+    dataSize = data.len,
+    aadSize = aad.len,
+    outputSize = result.len
 
-# Proc para descifrado (ampliación para completitud)
-proc decryptPayload*(encrypted: seq[byte], key: seq[byte], aad: seq[byte] = @[]): seq[byte] {.raises: [CryptoError].} =
-  ## Descifra un payload cifrado con XChaCha20-Poly1305 y verifica la integridad.
+proc decryptPayload*(ciphertext: seq[byte], key: seq[byte], aad: seq[byte] = @[]): seq[byte] {.raises: [CryptoError].} =
+  ## Descifra un payload cifrado con XChaCha20-Poly1305
   
-  let minLen = NONCE_SIZE + TAG_SIZE
-  if encrypted.len < minLen:
-    raise newException(CryptoError, "Datos cifrados demasiado cortos")
+  if key.len != KeySize:
+    raise newException(CryptoError, "Invalid key size")
   
-  if key.len != KEY_SIZE:
-    raise newException(CryptoError, "La clave debe tener exactamente " & $KEY_SIZE & " bytes")
+  if ciphertext.len < NonceSize + TagSize:
+    raise newException(CryptoError, "Ciphertext too short")
   
-  if aad.len > MAX_AAD_SIZE:
-    raise newException(CryptoError, "Los datos AAD exceden el límite de " & $MAX_AAD_SIZE & " bytes")
+  # Extraer nonce
+  var nonce = newSeq[byte](NonceSize)
+  copyMem(addr nonce[0], unsafeAddr ciphertext[0], NonceSize)
   
-  let nonce = encrypted[0 ..< NONCE_SIZE]
-  let ciphertextLen = encrypted.len - NONCE_SIZE - TAG_SIZE
-  let ciphertext = encrypted[NONCE_SIZE ..< NONCE_SIZE + ciphertextLen]
-  let providedTag = encrypted[^TAG_SIZE .. ^1]
+  # Preparar buffer para datos descifrados
+  let plaintextLen = ciphertext.len - NonceSize - TagSize
+  result = newSeq[byte](plaintextLen)
   
-  var ctx: XChaChaPoly
-  if not ctx.init(key, nonce):
-    raise newException(CryptoError, "Fallo en la inicialización del contexto de descifrado")
+  var plaintextLenOut: culonglong
   
-  ctx.updateAAD(aad)
+  let ret = crypto_aead_xchacha20poly1305_ietf_decrypt(
+    addr result[0],
+    addr plaintextLenOut,
+    nil,  # No secret nonce
+    unsafeAddr ciphertext[NonceSize],
+    (ciphertext.len - NonceSize).culonglong,
+    if aad.len > 0: unsafeAddr aad[0] else: nil,
+    aad.len.culonglong,
+    unsafeAddr nonce[0],
+    unsafeAddr key[0]
+  )
   
-  var plaintext = newSeq[byte](ciphertextLen)
-  ctx.decrypt(ciphertext, plaintext)
+  if ret != 0:
+    raise newException(CryptoError, "Decryption failed or authentication tag invalid")
   
-  var computedTag: array[TAG_SIZE, byte]
-  ctx.getTag(computedTag)
+  # Limpiar datos sensibles
+  zeroMem(addr nonce[0], NonceSize)
   
-  ctx.clear()
-  
-  if computedTag != providedTag.toOpenArrayByte(0, TAG_SIZE-1):
-    raise newException(CryptoError, "Fallo en la verificación de integridad (tag no coincide)")
-  
-  result = plaintext
+  debug "Payload decrypted", 
+    ciphertextSize = ciphertext.len,
+    plaintextSize = result.len
 
-# Proc para derivación de claves usando HKDF-SHA256
-proc deriveSessionKey*(masterKey: seq[byte], salt: seq[byte], info: string): seq[byte] {.raises: [CryptoError].} =
-  ## Deriva una clave de sesión a partir de una clave maestra usando HKDF-SHA256.
+# Gestión de contexto criptográfico
+proc newCryptoContext*(masterKey: seq[byte], rotationInterval = DefaultKeyRotationInterval): CryptoContext =
+  ## Crea un nuevo contexto criptográfico con gestión de claves
+  if masterKey.len != KeySize:
+    raise newException(CryptoError, "Master key must be 32 bytes")
   
-  if masterKey.len == 0:
-    raise newException(CryptoError, "Clave maestra vacía")
-  
-  var output: array[KEY_SIZE, byte]
-  hkdf(sha256, masterKey, salt, info.toBytes(), output)
-  
-  result = output.toSeq()
+  result = CryptoContext(
+    masterKey: masterKey,
+    sessionKeys: initTable[string, SessionKey](),
+    rotationInterval: rotationInterval,
+    lastRotation: now()
+  )
 
-# Ejemplo de uso seguro (como comentario)
-# proc enviarMensajeSeguro(node: P2PNode, mensaje: string, claveSesion: seq[byte]) =
-#   let data = mensaje.toBytes
-#   let aad = generateAadForMessage(node, mensaje)  # Contexto adicional (implementar en otro módulo)
-#   try:
-#     let ciphertext = encryptPayload(data, claveSesion, aad)
-#     node.enviar(ciphertext)
-#   except CryptoError as e:
-#     logError("Fallo en cifrado: " & e.msg)
-#     # Intentar recuperación
-#     reiniciarSesionCrypto(node)
+proc getOrCreateSessionKey*(ctx: CryptoContext, sessionId: string): seq[byte] =
+  ## Obtiene o crea una clave de sesión
+  
+  # Verificar si necesita rotación
+  if now() - ctx.lastRotation > ctx.rotationInterval:
+    ctx.sessionKeys.clear()
+    ctx.lastRotation = now()
+    info "Session keys rotated"
+  
+  if sessionId in ctx.sessionKeys:
+    var sessionKey = ctx.sessionKeys[sessionId]
+    
+    # Verificar límite de uso
+    if sessionKey.usageCount >= sessionKey.maxUsage:
+      # Regenerar clave
+      let salt = secureRandom(32)
+      let info = sessionId.toBytes
+      sessionKey.key = deriveKey(ctx.masterKey, salt, info)
+      sessionKey.createdAt = now()
+      sessionKey.usageCount = 0
+      ctx.sessionKeys[sessionId] = sessionKey
+      info "Session key regenerated", sessionId = sessionId
+    else:
+      inc sessionKey.usageCount
+      ctx.sessionKeys[sessionId] = sessionKey
+    
+    result = sessionKey.key
+  else:
+    # Crear nueva clave de sesión
+    let salt = secureRandom(32)
+    let info = sessionId.toBytes
+    let key = deriveKey(ctx.masterKey, salt, info)
+    
+    ctx.sessionKeys[sessionId] = SessionKey(
+      key: key,
+      createdAt: now(),
+      usageCount: 1,
+      maxUsage: MaxKeyUsage
+    )
+    
+    result = key
+    info "New session key created", sessionId = sessionId
 
-# Notas adicionales:
-# - Para rotación de claves: Implementar un temporizador que derive nuevas claves periódicamente usando deriveSessionKey con info único (e.g., "session_" & timestamp).
-# - Almacenamiento seguro: En Nim, considerar usar secure memory via lockMem/unlockMem de posix para evitar swap, pero requiere manejo manual.
-# - Forward secrecy: Usar claves efímeras derivadas por sesión y descartarlas después de uso.
-# - Verificación de integridad: Siempre usar decryptPayload para validar antes de procesar datos recibidos.
-# - Manejo de errores: En producción, capturar CryptoError y fallback a modos seguros o terminación.
+# Funciones auxiliares para AAD
+proc generateAadForMessage*(nodeId: string, messageType: string, timestamp: int64 = 0): seq[byte] =
+  ## Genera AAD para un mensaje con contexto
+  let ts = if timestamp == 0: epochTime().int64 else: timestamp
+  let aadString = nodeId & "|" & messageType & "|" & $ts
+  result = aadString.toBytes
+  
+  if result.len > MaxAadSize:
+    result = result[0..<MaxAadSize]
+
+# Limpieza segura de memoria
+proc secureWipe*(data: var seq[byte]) =
+  ## Limpia de forma segura datos sensibles de la memoria
+  if data.len > 0:
+    zeroMem(addr data[0], data.len)
+    data.setLen(0)
+
+# Ejemplo de uso con manejo robusto de errores
+proc enviarMensajeSeguro*(node: P2PNode, mensaje: string, ctx: CryptoContext) =
+  ## Envía un mensaje cifrado de forma segura
+  let data = mensaje.toBytes
+  let sessionId = node.peerId
+  
+  var claveSesion: seq[byte]
+  var ciphertext: seq[byte]
+  
+  try:
+    # Obtener clave de sesión
+    claveSesion = ctx.getOrCreateSessionKey(sessionId)
+    
+    # Generar AAD con contexto
+    let aad = generateAadForMessage(
+      node.id,
+      "message",
+      epochTime().int64
+    )
+    
+    # Cifrar payload
+    ciphertext = encryptPayload(data, claveSesion, aad)
+    
+    # Enviar mensaje cifrado
+    node.send(ciphertext)
+    
+    debug "Secure message sent",
+      nodeId = node.id,
+      messageSize = data.len,
+      ciphertextSize = ciphertext.len
+    
+  except CryptoError as e:
+    error "Encryption failed", 
+      error = e.msg,
+      nodeId = node.id
+    
+    # Intentar recuperación
+    try:
+      # Limpiar claves comprometidas
+      ctx.sessionKeys.del(sessionId)
+      
+      # Reintentar con nueva clave
+      claveSesion = ctx.getOrCreateSessionKey(sessionId)
+      let aad = generateAadForMessage(node.id, "message_retry")
+      ciphertext = encryptPayload(data, claveSesion, aad)
+      node.send(ciphertext)
+      
+      info "Message sent after recovery"
+      
+    except CryptoError as e2:
+      error "Recovery failed", error = e2.msg
+      raise
+  
+  finally:
+    # Limpiar datos sensibles
+    secureWipe(claveSesion)
+
+# Tests unitarios
+when isMainModule:
+  import unittest
+  
+  suite "Crypto Module Tests":
+    setup:
+      initCrypto()
+    
+    test "Encrypt and decrypt payload":
+      let key = secureRandom(KeySize)
+      let data = "Hello, World!".toBytes
+      let aad = "metadata".toBytes
+      
+      let encrypted = encryptPayload(data, key, aad)
+      let decrypted = decryptPayload(encrypted, key, aad)
+      
+      check decrypted == data
+    
+    test "Invalid key size":
+      let invalidKey = secureRandom(16)  # Wrong size
+      let data = "test".toBytes
+      
+      expect CryptoError:
+        discard encryptPayload(data, invalidKey)
+    
+    test "AAD validation":
+      let key = secureRandom(KeySize)
+      let data = "test".toBytes
+      let largeAad = newSeq[byte](MaxAadSize + 1)
+      
+      expect CryptoError:
+        discard encryptPayload(data, key, largeAad)
+    
+    test "Session key rotation":
+      let masterKey = secureRandom(KeySize)
+      let ctx = newCryptoContext(masterKey, initDuration(milliseconds = 100))
+      
+      let key1 = ctx.getOrCreateSessionKey("session1")
+      sleep(150)
+      let key2 = ctx.getOrCreateSessionKey("session1")
+      
+      check key1 != key2  # Keys should 
